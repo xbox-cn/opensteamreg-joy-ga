@@ -283,8 +283,18 @@ def main():
 
     password = (os.environ.get("JOY_PASSWORD") or "").strip()
     if not password:
-        # 确定性密码：同一邮箱在任何一轮都生成同一个值（HMAC-邮箱-密钥）。
-        # 注册被跳过的轮次不会改密码，随机生成会造成"两套密码"（本地登不上）。
+        # 已注册账号的真密码优先（JOY_PASSWORDS：每行 email----password）。
+        # 注册被跳过的轮次不会改密码，别的来源（HMAC/随机）都会造成"两套密码"。
+        table = (os.environ.get("JOY_PASSWORDS") or "").strip()
+        for line in table.splitlines():
+            parts = line.strip().split("----")
+            if len(parts) >= 2 and parts[0].lower() == row["email"].lower():
+                password = parts[1]
+                log("使用 JOY_PASSWORDS 里该账号的既定密码")
+                break
+    if not password:
+        # 确定性密码：同一邮箱在任何一轮都生成同一个值（HMAC-邮箱-密钥），
+        # 适用于"本轮新注册"的邮箱——下轮重跑同邮箱也一致。
         secret = (os.environ.get("JOY_PW_SECRET") or "").strip()
         if secret:
             import hashlib
