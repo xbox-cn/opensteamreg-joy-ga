@@ -184,10 +184,18 @@ def pick_exit_from_extract(url, log=print):
         probe.trust_env = False
         probe.verify = False
         probe.proxies = {"http": proxy, "https": proxy}
-        r = probe.get("http://api.ipify.org", timeout=30)
-        egress = (r.text or "").strip()[:40]
+        r = probe.get("http://ip-api.com/json?fields=query", timeout=30)
+        try:
+            egress = str((r.json() or {}).get("query") or "").strip()[:40]
+        except Exception:
+            egress = ""
     except Exception:
-        egress = "?"
+        egress = ""
+    import re as _re
+    if not _re.fullmatch(r"[0-9.]+", egress or ""):
+        # 网关回了 402 之类（Payment Required=流量耗尽）——继续跑只会全程失败
+        log(f"出口不可用（网关响应：{egress or '无响应'}）——大概率流量已耗尽")
+        return ""
     log(f"出口已选：{proxy.split('@')[-1]} sessid={sessid or '?'} 出口IP={egress}")
     return proxy
 
