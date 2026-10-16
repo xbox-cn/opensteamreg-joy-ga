@@ -24,6 +24,7 @@ jobs:
         env:
           JOY_EXTRACT_URL: ${{ secrets.JOY_EXTRACT_URL }}
           JOY_PROXY_FIXED: ${{ secrets.JOY_PROXY_FIXED }}
+          PYTHONIOENCODING: utf-8
         run: |
           python -m pip install -q requests
           @'
