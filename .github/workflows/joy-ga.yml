@@ -85,6 +85,7 @@ jobs:
         env:
           JOY_MAILBOX: ${{ steps.pick.outputs.mailbox }}
           JOY_EXTRACT_URL: ${{ secrets.JOY_EXTRACT_URL }}
+          JOY_PROXY: ${{ secrets.JOY_PROXY_FIXED }}
         run: |
           $ErrorActionPreference = "Continue"
           python ga_joy_run.py 2>&1 | Tee-Object -FilePath joy-attempt.log
