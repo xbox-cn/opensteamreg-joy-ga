@@ -325,7 +325,8 @@ def provision(email, password, gb=1, network_type="residential", product_id="",
     pa = proxy_to_camoufox(proxy)
     if pa:
         kw["proxy"] = pa
-        kw["geoip"] = True          # 同 signup：挂代理必须同步出口时区，否则 CF 盟解不出 token
+        _ip = _exit_ip_for_geoip(proxy)
+        kw["geoip"] = _ip or True      # 传 IP 字符串：跳过 Camoufox 经代理访问 ipecho.net（常被网关掐）
     log(f"[浏览器] 启动 Camoufox（{('代理 ' + pa['server']) if pa else '直连'}，显示 {info}）…")
     br = None
     try:
@@ -394,6 +395,25 @@ def provision(email, password, gb=1, network_type="residential", product_id="",
             except Exception:
                 pass
 
+def _exit_ip_for_geoip(proxy):
+    """经出口用 http 接口查公网 IP（给 Camoufox 的 geoip= 传 IP 字符串用）。
+
+    geoip=True 时 Camoufox 自己会经代理访问 ipecho.net（https）——JoyProxy 网关
+    常把这个请求掐掉（InvalidIP: Failed to get IP address）。传 IP 字符串则完全
+    本地查 mmdb，不出网。返回空串表示查不到（调用方退回 geoip=True）。"""
+    try:
+        import requests as _rq
+        s = _rq.Session()
+        s.trust_env = False
+        s.verify = False
+        s.proxies = {"http": proxy, "https": proxy}
+        r = s.get("http://ip-api.com/json?fields=query", timeout=25)
+        ip = str((r.json() or {}).get("query") or "").strip()
+        return ip if ip else ""
+    except Exception:
+        return ""
+
+
 REGISTER = BASE + "/register.html"
 
 
@@ -438,7 +458,8 @@ def signup(email, password, proxy=None, log=print, activate=None, claim=True, bu
     pa = proxy_to_camoufox(proxy)
     if pa:
         kw["proxy"] = pa
-        kw["geoip"] = True          # 按出口 IP 同步时区/地区；不同步时 CF 盾判环境不一致（GA 实测：12 个出口全灭，geoip 探针 10s 出 token）
+        _ip = _exit_ip_for_geoip(proxy)
+        kw["geoip"] = _ip or True      # 传 IP 字符串：跳过 ipecho.net（网关掐 https）；不同步时区则 CF 盾判环境不一致
     log(f"[浏览器] 启动 Camoufox（{('代理 ' + pa['server']) if pa else '直连（数据中心 IP 大概率过不了盾）'}，显示 {info}）…")
     br = None
     try:
