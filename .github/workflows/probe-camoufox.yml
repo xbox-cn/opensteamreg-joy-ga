@@ -1,0 +1,43 @@
+name: camoufox-exit-probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python -m pip install -q requests camoufox[geoip]
+          python -m camoufox fetch
+
+      - name: Camoufox + 出口 打开注册页看盾
+        shell: pwsh
+        env:
+          JOY_EXTRACT_URL: ${{ secrets.JOY_EXTRACT_URL }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          python probe_camoufox.py 2>&1 | Tee-Object -FilePath probe.log
+          Write-Host "=== 尾部 ==="
+          Get-Content probe.log -Tail 20
+
+      - name: 上传截图与日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-camoufox-${{ github.run_id }}
+          path: |
+            probe.log
+            probe_reg_*.png
+          if-no-files-found: ignore

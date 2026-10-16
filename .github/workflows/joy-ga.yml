@@ -1,0 +1,108 @@
+name: JoyProxy 全流程（GA）
+
+on:
+  workflow_dispatch:
+    inputs:
+      slots:
+        description: "并发槽位数（每个槽一个全新 Windows runner = 全新设备/出口）"
+        required: true
+        default: "3"
+      buy_gb:
+        description: "赠金到账后买多少 GB（0=只领取不购买）"
+        required: true
+        default: "1"
+      network_type:
+        description: "套餐类型"
+        required: true
+        default: "residential"
+
+concurrency:
+  group: joy-ga
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c "import json,os;n=int(os.environ['SLOTS']);print('matrix='+json.dumps({'slot':list(range(1,n+1))}))" >> "$GITHUB_OUTPUT"
+        env:
+          SLOTS: ${{ inputs.slots }}
+
+  joy:
+    needs: plan
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      JOY_MAILBOXES: ${{ secrets.JOY_MAILBOXES }}
+      JOY_BUY_GB: ${{ inputs.buy_gb }}
+      JOY_NETWORK: ${{ inputs.network_type }}
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        shell: pwsh
+        env:
+          # camoufox fetch 走 api.github.com，匿名会被共享 runner IP 限流 → 用 Actions 自带 token
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests patchright camoufox[geoip]
+          python -m camoufox fetch
+
+      - name: 挑本槽的邮箱
+        id: pick
+        shell: pwsh
+        run: |
+          $lines = ($env:JOY_MAILBOXES -split "`n" | Where-Object { $_.Trim() -ne "" })
+          $i = ${{ matrix.slot }} - 1
+          if ($lines.Count -le $i) {
+            Write-Host "邮箱池不够：需要第 $($i+1) 条，只有 $($lines.Count) 条"
+            "mailbox=" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "mailbox=$($lines[$i].Trim())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: 跑 JoyProxy 全流程
+        id: joy
+        if: steps.pick.outputs.mailbox != ''
+        shell: pwsh
+        continue-on-error: true
+        env:
+          JOY_MAILBOX: ${{ steps.pick.outputs.mailbox }}
+          JOY_EXTRACT_URL: ${{ secrets.JOY_EXTRACT_URL }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          python ga_joy_run.py 2>&1 | Tee-Object -FilePath joy-attempt.log
+          "exit=$LASTEXITCODE" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: 汇总
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "## JoyProxy slot ${{ matrix.slot }}" >> $env:GITHUB_STEP_SUMMARY
+          Get-Content joy-attempt.log -ErrorAction SilentlyContinue |
+            Select-String -Pattern "GA_RESULT=|✔|✘|Turnstile|Edge|余额|领取" |
+            Select-Object -Last 30 | ForEach-Object { $_.Line } >> $env:GITHUB_STEP_SUMMARY
+
+      - name: 上传日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: joy-slot-${{ matrix.slot }}-${{ github.run_id }}
+          path: joy-attempt.log
+          if-no-files-found: ignore

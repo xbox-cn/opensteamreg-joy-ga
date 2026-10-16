@@ -1,0 +1,60 @@
+name: joy-exit-probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 直连出口 IP（对照）
+        shell: pwsh
+        run: |
+          try { (Invoke-RestMethod -Uri "https://api.ipify.org?format=json" -TimeoutSec 20).ip }
+          catch { "direct failed: $($_.Exception.Message)" }
+
+      - name: 通过 JoyProxy 提取链接取出口并测试
+        shell: pwsh
+        env:
+          JOY_EXTRACT_URL: ${{ secrets.JOY_EXTRACT_URL }}
+        run: |
+          python -m pip install -q requests
+          @'
+          import os, re, random, sys
+          import requests
+
+          url = (os.environ.get("JOY_EXTRACT_URL") or "").strip()
+          if not url:
+              print("no JOY_EXTRACT_URL secret"); sys.exit(0)
+          url = re.sub(r"duration=[^&]*", "duration=30m", url)
+          if "network_type=" not in url:
+              url += "&network_type=cellular"
+
+          s = requests.Session(); s.trust_env = False; s.verify = False
+          try:
+              r = s.get(url, timeout=60)
+          except Exception as e:
+              print("extract failed:", type(e).__name__, str(e)[:120]); sys.exit(0)
+          lines = [x.strip() for x in re.split(r"[\r\n]+", r.text or "") if x.strip()]
+          print("extract status:", r.status_code, "lines:", len(lines))
+          if not lines:
+              print("body:", (r.text or "")[:200]); sys.exit(0)
+          px = lines[0] if lines[0].startswith("http") else "http://" + lines[0]
+          print("exit host:", px.split("@")[-1])
+
+          t = requests.Session(); t.trust_env = False; t.verify = False
+          t.proxies = {"http": px, "https": px}
+          for target in ("http://api.ipify.org", "https://api.ipify.org"):
+              try:
+                  rr = t.get(target, timeout=40)
+                  print(target, "->", rr.status_code, (rr.text or "")[:60])
+              except Exception as e:
+                  print(target, "->", type(e).__name__, str(e)[:110])
+          '@ | Out-File -Encoding utf8 probe_exit.py
+          python probe_exit.py
