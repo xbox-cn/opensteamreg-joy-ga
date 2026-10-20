@@ -70,17 +70,16 @@ jobs:
           Pop-Location
           "SUN_PROFILE=$id" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Extract cellular exit + start relay
+      - name: Start relay (main gate, sticky session)
         if: ${{ inputs.use_proxy }}
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $url = "${{ secrets.JOY_EXTRACT_URL }}"
-          if (-not $url) { throw "缺 JOY_EXTRACT_URL secret" }
-          $fresh = "$($url -replace 'count=\d+', 'count=1')&" + "t=" + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-          $exit = (Invoke-WebRequest -Uri $fresh -TimeoutSec 40 -UseBasicParsing).Content.Trim().Split("`n")[0].Trim()
-          if (-not $exit.StartsWith("http")) { throw "extract 没返回出口：$exit" }
-          Write-Host "exit_line=$($exit -replace '://.*@', '://***@')"
+          $exit = "${{ secrets.JOY_PROXY_URL }}"
+          if (-not $exit) { throw "缺 JOY_PROXY_URL secret" }
+          $sid = -join ((97..122) + (48..57) | Get-Random -Count 8 | ForEach-Object {[char]$_})
+          $exit = $exit -replace 'sessid-[a-z0-9]+', "sessid-$sid"
+          Write-Host "exit_line=$($exit -replace '://.*@', '://***@') (sessid=$sid)"
           "JOY_PROXY_URL=$exit" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           $env:JOY_PROXY_URL = $exit
           Start-Process -FilePath python -ArgumentList "joy_relay.py","18080" -WindowStyle Hidden -RedirectStandardOutput "$env:RUNNER_TEMP/relay.out.log" -RedirectStandardError "$env:RUNNER_TEMP/relay.err.log"
@@ -88,7 +87,7 @@ jobs:
           try {
             $r = Invoke-WebRequest -Uri "http://127.0.0.1:18080/" -TimeoutSec 5 -UseBasicParsing -SkipHttpErrorCheck
             Write-Host "relay probe: HTTP $($r.StatusCode) (501=alive)"
-          } catch { Write-Host "relay probe FAILED: $_"; Get-Content "$env:RUNNER_TEMP/relay.err.log" -ErrorAction SilentlyContinue | Select-Object -First 10 }
+          } catch { Write-Host "relay probe FAILED: $_" }
           Write-Host "relay step done"
 
       - name: Launch SunBrowser
