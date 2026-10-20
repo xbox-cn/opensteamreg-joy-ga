@@ -81,14 +81,7 @@ jobs:
           $exit = $exit -replace 'sessid-[a-z0-9]+', "sessid-$sid"
           Write-Host "exit_line=$($exit -replace '://.*@', '://***@') (sessid=$sid)"
           "JOY_PROXY_URL=$exit" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          $env:JOY_PROXY_URL = $exit
-          Start-Process -FilePath python -ArgumentList "joy_relay.py","18080" -WindowStyle Hidden -RedirectStandardOutput "$env:RUNNER_TEMP/relay.out.log" -RedirectStandardError "$env:RUNNER_TEMP/relay.err.log"
-          Start-Sleep -Seconds 3
-          try {
-            $r = Invoke-WebRequest -Uri "http://127.0.0.1:18080/" -TimeoutSec 5 -UseBasicParsing -SkipHttpErrorCheck
-            Write-Host "relay probe: HTTP $($r.StatusCode) (501=alive)"
-          } catch { Write-Host "relay probe FAILED: $_" }
-          Write-Host "relay step done"
+          Write-Host "relay URL prepared (starts in Run claim step)"
 
       - name: Launch SunBrowser
         shell: pwsh
@@ -122,6 +115,14 @@ jobs:
           $env:JOY_PASSWORD = "${{ secrets.JOY_CLAIM_PASSWORD }}"
           $env:JOY_MAILBOX = "${{ secrets.JOY_MAILBOX_LINE }}"
           if (-not $env:JOY_MAILBOX) { throw "缺 JOY_MAILBOX_LINE secret" }
+          if ("${{ inputs.use_proxy }}" -eq "true" -and $env:JOY_PROXY_URL) {
+            Start-Process -FilePath python -ArgumentList "joy_relay.py","18080" -WindowStyle Hidden -RedirectStandardOutput "$env:RUNNER_TEMP/relay.out.log" -RedirectStandardError "$env:RUNNER_TEMP/relay.err.log"
+            Start-Sleep -Seconds 3
+            try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:18080/" -TimeoutSec 5 -UseBasicParsing -SkipHttpErrorCheck
+              Write-Host "relay probe: HTTP $($r.StatusCode) (501=alive)"
+            } catch { Write-Host "relay probe FAILED: $_" }
+          }
           python sun_claim.py 2>&1 | Tee-Object -FilePath joy-claim.log
           Write-Host "exit=$LASTEXITCODE"
 
