@@ -11,6 +11,11 @@ on:
         description: "Job timeout minutes"
         required: true
         default: "25"
+      use_proxy:
+        description: "Route SunBrowser through a cellular exit (JOY_EXTRACT_URL) via local relay"
+        type: boolean
+        required: true
+        default: false
 
 jobs:
   sun-claim:
@@ -65,12 +70,31 @@ jobs:
           Pop-Location
           "SUN_PROFILE=$id" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: Extract cellular exit + start relay
+        if: ${{ inputs.use_proxy }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "${{ secrets.JOY_EXTRACT_URL }}"
+          if (-not $url) { throw "缺 JOY_EXTRACT_URL secret" }
+          $fresh = "$($url -replace 'count=\d+', 'count=1')&" + "t=" + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $exit = (Invoke-WebRequest -Uri $fresh -TimeoutSec 40 -UseBasicParsing).Content.Trim().Split("`n")[0].Trim()
+          if (-not $exit.StartsWith("http")) { throw "extract 没返回出口：$exit" }
+          Write-Host "exit_line=$($exit -replace '://.*@', '://***@')"
+          "JOY_PROXY_URL=$exit" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $env:JOY_PROXY_URL = $exit
+          Start-Process -FilePath python -ArgumentList "joy_relay.py","18080" -WindowStyle Hidden
+          Start-Sleep -Seconds 3
+          Write-Host "relay started on 18080"
+
       - name: Launch SunBrowser
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
+          $proxyArgs = @()
+          if ("${{ inputs.use_proxy }}" -eq "true") { $proxyArgs = @("--proxy","http://127.0.0.1:18080"); Write-Host "browser via relay 18080" }
           Push-Location "$env:SUN_ROOT"
-          Start-Process -FilePath "node" -ArgumentList "portable-launcher.mjs","--profile","$env:SUN_PROFILE","--remote-debugging-port","9222","--url","about:blank" -WindowStyle Hidden
+          Start-Process -FilePath "node" -ArgumentList @("portable-launcher.mjs","--profile","$env:SUN_PROFILE","--remote-debugging-port","9222","--url","about:blank") + $proxyArgs -WindowStyle Hidden
           Pop-Location
           $ok = $false
           for ($i = 0; $i -lt 40; $i++) {
