@@ -122,7 +122,11 @@ def main():
         JB._dismiss_cookie(page, log)
         page.wait_for_timeout(800)
 
+        st_w, wc = JB._fetch(page, "/api/user/welcome-credit")
+        log(f"wc_before={json.dumps(wc, ensure_ascii=False)[:600]}")
         ok_c, detail_c = JB._claim(page, log)
+        st_w2, wc2 = JB._fetch(page, "/api/user/welcome-credit")
+        log(f"wc_after={json.dumps(wc2, ensure_ascii=False)[:600]}")
         bal = JB._balance(page)
         out["claim"] = detail_c
         out["balance"] = bal
