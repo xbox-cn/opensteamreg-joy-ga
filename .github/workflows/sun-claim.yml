@@ -114,6 +114,7 @@ jobs:
           if (-not $env:JOY_EMAIL) { $env:JOY_EMAIL = "${{ secrets.JOY_CLAIM_EMAIL }}" }
           $env:JOY_PASSWORD = "${{ secrets.JOY_CLAIM_PASSWORD }}"
           $env:JOY_MAILBOX = "${{ secrets.JOY_MAILBOX_LINE }}"
+          $env:JOY_NEW_PASSWORD = "${{ secrets.JOY_JOY_PW }}"
           if (-not $env:JOY_MAILBOX) { throw "缺 JOY_MAILBOX_LINE secret" }
           if ("${{ inputs.use_proxy }}" -eq "true" -and $env:JOY_PROXY_URL) {
             Start-Process -FilePath python -ArgumentList "joy_relay.py","18080" -WindowStyle Hidden -RedirectStandardOutput "$env:RUNNER_TEMP/relay.out.log" -RedirectStandardError "$env:RUNNER_TEMP/relay.err.log"
