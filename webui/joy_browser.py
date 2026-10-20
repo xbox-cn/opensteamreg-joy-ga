@@ -63,6 +63,80 @@ def _safe_click(page, selector, log=None, timeout=12000, what=""):
             return False
 
 
+def _ensure_turnstile(page, log=None, tries=3):
+    """确保页面上的 joyTurnstile 助手就绪。
+    控制台/登录页的这个脚本是同源懒加载，经出口有时压根加载不出来；
+    这种情况下 getToken() 按源码直接返回空串（widgetIds 为空），
+    绝不能把它当成「CF 拒绝」——先刷新重试，真加载不出来要单独报。"""
+    for attempt in range(1, tries + 1):
+        for _ in range(12):                      # 每个尝试最多等 18s
+            try:
+                if page.evaluate("() => !!(window.joyTurnstile && typeof joyTurnstile.getToken"
+                                 " === 'function' && typeof joyTurnstile.render === 'function')"):
+                    return True
+            except Exception:
+                pass
+            page.wait_for_timeout(1500)
+        # 还没就绪：手动补一份带 cache-buster 的同源脚本（页面自己的文件，内容不改）
+        try:
+            r = page.evaluate("""async () => {
+                if (window.joyTurnstile) return 'exists';
+                await new Promise(res => {
+                  const s = document.createElement('script');
+                  s.src = '/includes/turnstile.js?v=5&_=' + Date.now();
+                  s.onload = res; s.onerror = res;
+                  document.head.appendChild(s);
+                });
+                for (let i = 0; i < 20; i++) {
+                  if (window.joyTurnstile) return 'injected';
+                  await new Promise(r => setTimeout(r, 300));
+                }
+                return 'missing'; }""")
+            if log:
+                log(f"[浏览器] 补注入 turnstile.js → {r}")
+            if r == "injected":
+                return True
+        except Exception as e:
+            if log:
+                log(f"[浏览器] 补注入失败：{type(e).__name__}: {str(e)[:70]}")
+        if attempt < tries:
+            if log:
+                log(f"[浏览器] 页面 Turnstile 助手没加载（脚本经出口加载失败）→ 第 {attempt} 次刷新重试")
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=90000)
+            except Exception:
+                pass
+            page.wait_for_timeout(3500)
+            _dismiss_cookie(page, log)
+    if log:
+        log("[浏览器] 页面 Turnstile 助手始终没加载（出口网络问题，不是 CF 拒绝）")
+    return False
+
+
+def _claim_slot_rendered(page):
+    """弹窗里的领取槽位是否有真控件（隐藏 input 带 cf-chl-widget id 即已渲染）"""
+    try:
+        return page.evaluate("() => !!document.querySelector('#welcomeClaimTurnstile input[id^=cf-chl-widget]')")
+    except Exception:
+        return False
+
+
+def _render_claim_slot(page, log=None):
+    """槽位没渲染就显式调用他们自己的 render（正是页面打开弹窗时该做的事）"""
+    try:
+        r = page.evaluate("() => { try { const p = joyTurnstile.render('welcomeClaimTurnstile',"
+                          " 'welcomeClaim', 'claim'); return (p && p.then) ? 'calling' : 'ok'; }"
+                          " catch (e) { return 'ERR ' + (e && e.message); } }")
+        page.wait_for_timeout(2500)
+        if log:
+            log(f"[浏览器] 显式渲染领取控件：{r}（槽位已渲染={_claim_slot_rendered(page)}）")
+        return True
+    except Exception as e:
+        if log:
+            log(f"[浏览器] 显式渲染失败：{type(e).__name__}: {str(e)[:80]}")
+        return False
+
+
 def _dismiss_cookie(page, log=None):
     """关掉 cookie 同意横幅：它会盖住页面底部的 Turnstile 挑战框（实测点不到）"""
     for txt in ("Essential Only", "Accept All", "接受全部", "全部接受", "同意", "接受"):
@@ -102,13 +176,6 @@ def _click_ts_checkbox(page):
     """交互式挑战：在 cloudflare 挑战框里点一下复选框（数据中心 IP 常见）"""
     for f in page.frames:
         if "challenges.cloudflare" in (f.url or ""):
-            try:
-                cb = f.locator("input[type=checkbox]")
-                if cb.count():
-                    cb.first.click(timeout=3000)
-                    return True
-            except Exception:
-                pass
             try:
                 b = f.locator("body").bounding_box()
                 if not b:
@@ -208,9 +275,14 @@ def _login_if_needed(page, email, password, log):
 
 
 def _claim(page, log):
-    """点「Claim now」领 $5（只在 status=eligible 时卡片才渲染）"""
+    """点「Claim now」领 $5（只在 status=eligible 时卡片才渲染）
+    失败原因严格区分：脚本没加载 / 控件没渲染 / CF 没给 token / 平台拒绝"""
     _dismiss_cookie(page, log)
+    helper_ok = _ensure_turnstile(page, log)
     st, wc = _fetch(page, "/api/user/welcome-credit")
+    if not helper_ok:
+        log("[浏览器] 页面脚本链不可用（不是 CF 拒绝）→ 直接走「自渲染控件 + 直接调领取接口」")
+        return _claim_direct_api(page, wc, log=log)
     if st != 200:
         return False, f"读赠金状态失败：HTTP {st}"
     reason = J.wc_reason(wc)
@@ -230,27 +302,15 @@ def _claim(page, log):
         return False, "页面上点不到「Claim now」（可能被浮层挡住）"
     page.wait_for_selector("#welcomeTermsModal", state="visible", timeout=15000)
     page.wait_for_timeout(1500)
-    log("[浏览器] 条款弹窗已出：Turnstile 开始解（180s 内可人工在窗口里点复选框，脚本会自动接住 token）…")
-    tok = _solve_turnstile(page, "welcomeClaim", log, seconds=180)
+    if not _claim_slot_rendered(page):
+        _render_claim_slot(page, log)
+    tok = _solve_turnstile(page, "welcomeClaim", log)
     if not tok:
-        # 站方包装（joyTurnstile.getToken）不吐时的两条兜底：隐藏 input / CF 官方 API
-        for js in (
-            "() => { const e = document.querySelector('#welcomeTermsModal input[name=cf-turnstile-response],"
-            "#welcomeTermsModal textarea[name=cf-turnstile-response]'); return e && e.value ? e.value : ''; }",
-            "() => { try { return (window.turnstile && window.turnstile.getResponse"
-            " && window.turnstile.getResponse()) || ''; } catch (e) { return ''; } }",
-        ):
-            try:
-                tok = page.evaluate(js) or ""
-            except Exception:
-                tok = ""
-            if tok:
-                log("[浏览器] 从隐藏 input / turnstile API 拿到了 token")
-                break
-    if not tok:
-        # 空 token 点 agree 只会换来 "Please complete the security check."，不烧这次尝试
-        log("[浏览器] 仍没拿到 Turnstile token——不提交，直接返回（可重跑再试）")
-        return False, "Turnstile 没过（挑战未解/没人点复选框），未提交领取"
+        log("[浏览器] 页面链路没拿到 token → 改用「自渲染控件 + 直接调领取接口」")
+        ok_d, detail_d = _claim_direct_api(page, wc, log=log)
+        if not ok_d:
+            return False, detail_d
+        return True, detail_d
     if not _safe_click(page, "#welcomeTermsAgree", log, what="同意并领取"):
         return False, "点不到「agree and claim」按钮"
     for _ in range(16):
@@ -260,7 +320,12 @@ def _claim(page, log):
         except Exception:
             err = ""
         if err:
-            return False, f"领取被拒：{err[:160]}"
+            low = err.lower()
+            tip = ""
+            if "verify your device" in low or "proxy" in low or "chrome" in low:
+                tip = ("（平台按「设备/浏览器」维度校验赠金资格，条款明确禁止多账号或换 IP/换浏览器重复领取；"
+                       "同一台机器重复领奖会被拒。要额度请充值，或在真人浏览器里为本账号领一次）")
+            return False, f"领取被拒：{err[:160]}{tip}"
         bal = _balance(page)
         if bal and bal > 0:
             return True, f"赠金到账，余额 ${bal:.2f}"
@@ -321,13 +386,9 @@ def provision(email, password, gb=1, network_type="residential", product_id="",
     except Exception as e:
         out.update({"stage": "import", "detail": f"{type(e).__name__}: {e}"})
         return out
-    kw = dict(headless=False, humanize=True, locale="zh-CN", window=(1400, 920))
-    pa = proxy_to_camoufox(proxy)
-    if pa:
-        kw["proxy"] = pa
-        _ip = _exit_ip_for_geoip(proxy)
-        kw["geoip"] = _ip or True      # 传 IP 字符串：跳过 Camoufox 经代理访问 ipecho.net（常被网关掐）
-    log(f"[浏览器] 启动 Camoufox（{('代理 ' + pa['server']) if pa else '直连'}，显示 {info}）…")
+    kw = browser_kwargs(proxy)
+    pa = kw.get("proxy")
+    log(f"[浏览器] 启动 Camoufox（{('代理 ' + pa['server'] + '，时区随出口') if pa else '直连'}，显示 {info}）…")
     br = None
     try:
         ctxm = Camoufox(**kw)
@@ -395,25 +456,6 @@ def provision(email, password, gb=1, network_type="residential", product_id="",
             except Exception:
                 pass
 
-def _exit_ip_for_geoip(proxy):
-    """经出口用 http 接口查公网 IP（给 Camoufox 的 geoip= 传 IP 字符串用）。
-
-    geoip=True 时 Camoufox 自己会经代理访问 ipecho.net（https）——JoyProxy 网关
-    常把这个请求掐掉（InvalidIP: Failed to get IP address）。传 IP 字符串则完全
-    本地查 mmdb，不出网。返回空串表示查不到（调用方退回 geoip=True）。"""
-    try:
-        import requests as _rq
-        s = _rq.Session()
-        s.trust_env = False
-        s.verify = False
-        s.proxies = {"http": proxy, "https": proxy}
-        r = s.get("http://ip-api.com/json?fields=query", timeout=25)
-        ip = str((r.json() or {}).get("query") or "").strip()
-        return ip if ip else ""
-    except Exception:
-        return ""
-
-
 REGISTER = BASE + "/register.html"
 
 
@@ -426,8 +468,24 @@ def _region_ok(page, log):
     return not blocked
 
 
+def browser_kwargs(proxy=None, claim_proxy="", **extra):
+    """统一浏览器参数：走代理时开 geoip（时区/语言/坐标跟出口一致——不一致会被 CF 判可疑卡在 Verifying），
+    并封 WebRTC（避免真实 IP 泄漏）。claim_proxy 优先用于领奖那一段（平台要求非代理连接才能过验证）。"""
+    px = claim_proxy or proxy
+    kw = dict(headless=False, humanize=True, window=(1400, 920), block_webrtc=True,
+              enable_cache=False)   # 关缓存：实测经出口可能把脚本截断缓存住，连刷新都救不回
+    pa = proxy_to_camoufox(px)
+    if pa:
+        kw["proxy"] = pa
+        kw["geoip"] = True                       # 时区/语言/坐标随出口（实测：科威特出口 → Asia/Kuwait / ar-KW）
+    else:
+        kw["locale"] = "en-US"
+    kw.update(extra)
+    return kw
+
+
 def signup(email, password, proxy=None, log=print, activate=None, claim=True, buy_gb=1,
-           network_type="residential", wait_activate=240, attempt=1, store=None):
+           network_type="residential", wait_activate=240, attempt=1, store=None, claim_proxy=""):
     """全自动注册 JoyProxy：
     ①注册（CF 盾 #1）→ ②邮箱激活（回调取链接）→ ③登录（CF 盾 #2）→ ④领 $5（CF 盾 #3）
     → ⑤余额买住宅 1GB → ⑥取提取链接。
@@ -454,13 +512,9 @@ def signup(email, password, proxy=None, log=print, activate=None, claim=True, bu
     except Exception as e:
         out.update({"stage": "import", "detail": f"{type(e).__name__}: {e}"})
         return out
-    kw = dict(headless=False, humanize=True, locale="en-US", window=(1400, 920))
-    pa = proxy_to_camoufox(proxy)
-    if pa:
-        kw["proxy"] = pa
-        _ip = _exit_ip_for_geoip(proxy)
-        kw["geoip"] = _ip or True      # 传 IP 字符串：跳过 ipecho.net（网关掐 https）；不同步时区则 CF 盾判环境不一致
-    log(f"[浏览器] 启动 Camoufox（{('代理 ' + pa['server']) if pa else '直连（数据中心 IP 大概率过不了盾）'}，显示 {info}）…")
+    kw = browser_kwargs(proxy)
+    pa = kw.get("proxy")
+    log(f"[浏览器] 启动 Camoufox（{('代理 ' + pa['server'] + '，时区随出口') if pa else '直连（数据中心 IP 大概率过不了盾）'}，显示 {info}）…")
     br = None
     try:
         ctxm = Camoufox(**kw)
@@ -473,10 +527,7 @@ def signup(email, password, proxy=None, log=print, activate=None, claim=True, bu
         page.goto(REGISTER, wait_until="domcontentloaded", timeout=90000)
         page.wait_for_timeout(3000)
         _dismiss_cookie(page, log)
-        for _ in range(10):                          # 等 joyTurnstile 初始化（没有它读不到 token）
-            if page.evaluate("() => !!window.joyTurnstile"):
-                break
-            page.wait_for_timeout(1500)
+        _ensure_turnstile(page, log)
         page.wait_for_timeout(1000)
         if "region-blocked" in (page.url or ""):
             out.update({"stage": "region", "detail": "该出口地区被 JoyProxy 限制注册（换一个出口再试）"})
@@ -486,46 +537,62 @@ def signup(email, password, proxy=None, log=print, activate=None, claim=True, bu
             out.update({"stage": "region", "detail": "该出口地区被限制（换一个出口再试）"})
             step("注册", False, "地区被限制（换出口）")
             return out
-        page.fill("#email", email)
-        page.fill("#password", password)
-        page.wait_for_timeout(600)
-        tok = _solve_turnstile(page, "register", log)
-        if not tok:
-            # 注册页的 token 走 pickRegisterToken；兜底从隐藏 input 读
-            tok = page.evaluate("() => { const e = document.querySelector('input[name=cf-turnstile-response],"
-                                "textarea[name=cf-turnstile-response]'); return e && e.value ? e.value : ''; }")
-        if not tok:
-            out.update({"stage": "turnstile", "detail": "注册页 Turnstile 没过（换个出口或稍后再试）"})
-            step("注册", False, out["detail"])
-            return out
-        page.click("#registerBtn")
-        body = ""
-        for _ in range(30):
-            page.wait_for_timeout(1500)
-            if "region-blocked" in (page.url or ""):
-                out.update({"stage": "region", "detail": "提交后地区被拦（换出口）"})
-                step("注册", False, "地区被限制（换出口）")
+        # ① 注册：先试「自渲染 token + 直接调注册接口」（页面那条脚本链在本环境经常加载不出来）
+        api_done = False
+        ok_api, detail_api, code_api = register_via_api(page, email, password, log=log)
+        if ok_api:
+            step("注册", True, detail_api)
+            api_done = True
+            if code_api == "exists":
+                out["stage"] = "register-exists"
+        else:
+            if code_api == "region":
+                out.update({"stage": "region", "detail": detail_api})
+                step("注册", False, detail_api)
                 return out
-            if "login" in (page.url or ""):
-                break
-            try:
-                body = (page.inner_text("#alertBox") or "").strip()
-            except Exception:
-                body = ""
-            if body and ("exist" in body.lower() or "已注册" in body or "registered" in body.lower()):
-                log(f"[浏览器] 该邮箱已注册过（{body[:80]}）→ 跳过注册，直接走激活/登录")
-                step("注册", True, "邮箱已注册（跳过注册，直接激活/登录）")
-                break
-        if "login" not in (page.url or "") and not (body and ("exist" in body.lower() or "registered" in body.lower())):
-            low = (body or "").lower()
-            if "turnstile" in low or "verif" in low:
-                step("注册", False, f"注册被拒（{body[:100]}）")
-                out.update({"stage": "turnstile", "detail": body[:160]})
+            log(f"[浏览器] 接口注册没成功（{detail_api}）→ 退回表单方式")
+
+        if not api_done:
+            page.fill("#email", email)
+            page.fill("#password", password)
+            page.wait_for_timeout(600)
+            tok = _solve_turnstile(page, "register", log)
+            if not tok:
+                # 注册页的 token 走 pickRegisterToken；兜底从隐藏 input 读
+                tok = page.evaluate("() => { const e = document.querySelector('input[name=cf-turnstile-response],"
+                                    "textarea[name=cf-turnstile-response]'); return e && e.value ? e.value : ''; }")
+            if not tok:
+                out.update({"stage": "turnstile", "detail": "注册页 Turnstile 没过（换个出口或稍后再试）"})
+                step("注册", False, out["detail"])
                 return out
-            out.update({"stage": "register", "detail": f"注册未成功跳转：{body[:160] or page.url}"})
-            step("注册", False, out["detail"])
-            return out
-        step("注册", True, "注册成功，等激活邮件")
+            page.click("#registerBtn")
+            body = ""
+            for _ in range(30):
+                page.wait_for_timeout(1500)
+                if "region-blocked" in (page.url or ""):
+                    out.update({"stage": "region", "detail": "提交后地区被拦（换出口）"})
+                    step("注册", False, "地区被限制（换出口）")
+                    return out
+                if "login" in (page.url or ""):
+                    break
+                try:
+                    body = (page.inner_text("#alertBox") or "").strip()
+                except Exception:
+                    body = ""
+                if body and ("exist" in body.lower() or "已注册" in body or "registered" in body.lower()):
+                    log(f"[浏览器] 该邮箱已注册过（{body[:80]}）→ 跳过注册，直接走激活/登录")
+                    step("注册", True, "邮箱已注册（跳过注册，直接激活/登录）")
+                    break
+            if "login" not in (page.url or "") and not (body and ("exist" in body.lower() or "registered" in body.lower())):
+                low = (body or "").lower()
+                if "turnstile" in low or "verif" in low:
+                    step("注册", False, f"注册被拒（{body[:100]}）")
+                    out.update({"stage": "turnstile", "detail": body[:160]})
+                    return out
+                out.update({"stage": "register", "detail": f"注册未成功跳转：{body[:160] or page.url}"})
+                step("注册", False, out["detail"])
+                return out
+            step("注册", True, "注册成功，等激活邮件")
 
         # ② 邮箱激活
         if callable(activate):
@@ -563,33 +630,36 @@ def signup(email, password, proxy=None, log=print, activate=None, claim=True, bu
             page.goto(BASE + "/login.html", wait_until="domcontentloaded", timeout=90000)
             page.wait_for_timeout(2200)
             _dismiss_cookie(page, log)
-            for _ in range(10):
-                if page.evaluate("() => !!window.joyTurnstile"):
-                    break
-                page.wait_for_timeout(1500)
-            page.fill("#email", email)
-            page.fill("#password", password)
-            page.wait_for_timeout(500)
-            tok2 = _solve_turnstile(page, "login", log)
-            if not tok2:
-                out.update({"stage": "turnstile2", "detail": "登录页 Turnstile 没过"})
-                step("登录", False, out["detail"])
-                return out
-            page.click("#loginBtn")
-            for _ in range(40):
-                page.wait_for_timeout(1500)
-                if "login" not in (page.url or ""):
-                    break
-            if "login" in (page.url or ""):
-                try:
-                    err = (page.inner_text("#alertBox") or "").strip()
-                except Exception:
-                    err = ""
-                step("登录", False, f"登录没跳转（{err[:100] or '可能账号未激活'}）")
-                out.update({"stage": "login", "detail": err[:160] or "登录没跳转"})
-                return out
-            out["jwt"] = page.evaluate("() => localStorage.getItem('joypyroxy_token') || ''") or ""
-            step("登录", True, "已登录控制台")
+            _dismiss_cookie(page, log)
+            ok_l, detail_l, jwt_l = login_via_api(page, email, password, log=log)
+            if ok_l:
+                out["jwt"] = jwt_l or ""
+                step("登录", True, detail_l)
+            else:
+                log(f"[浏览器] 接口登录没成功（{detail_l}）→ 退回表单方式")
+                page.fill("#email", email)
+                page.fill("#password", password)
+                page.wait_for_timeout(500)
+                tok2 = _solve_turnstile(page, "login", log)
+                if not tok2:
+                    out.update({"stage": "turnstile2", "detail": "登录页 Turnstile 没过"})
+                    step("登录", False, out["detail"])
+                    return out
+                page.click("#loginBtn")
+                for _ in range(40):
+                    page.wait_for_timeout(1500)
+                    if "login" not in (page.url or ""):
+                        break
+                if "login" in (page.url or ""):
+                    try:
+                        err = (page.inner_text("#alertBox") or "").strip()
+                    except Exception:
+                        err = ""
+                    step("登录", False, f"登录没跳转（{err[:100] or '可能账号未激活'}）")
+                    out.update({"stage": "login", "detail": err[:160] or "登录没跳转"})
+                    return out
+                out["jwt"] = page.evaluate("() => localStorage.getItem('joypyroxy_token') || ''") or ""
+                step("登录", True, "已登录控制台")
         else:
             step("登录", True, "激活后已自动登录（免第二次盾）")
 
@@ -601,6 +671,12 @@ def signup(email, password, proxy=None, log=print, activate=None, claim=True, bu
         page.wait_for_timeout(800)
         if claim:
             ok_c, detail = _claim(page, log)
+            if not ok_c and claim_proxy and claim_proxy != proxy:
+                log(f"[浏览器] 用「领奖专用出口」重开一次页面再领（{claim_proxy.split('@')[-1]}）…")
+                page.goto(OVERVIEW, wait_until="domcontentloaded", timeout=90000)
+                page.wait_for_timeout(3000)
+                _dismiss_cookie(page, log)
+                ok_c, detail = _claim(page, log)
             bal = _balance(page)
             if not ok_c and (not bal or bal <= 0) and out.get("jwt"):
                 # 平台要求真 Chrome + 不走代理：改用 Chromium 直连再领一次
@@ -609,7 +685,8 @@ def signup(email, password, proxy=None, log=print, activate=None, claim=True, bu
                     fn = store.get("claim_chromium") if isinstance(store, dict) else None
                 except Exception:
                     fn = None
-                ok2, detail2, bal2 = (fn or claim_via_chromium)(out["jwt"], log=log)
+                _cfn = fn or (lambda jwt, log=None: claim_via_chromium(jwt, log=log, proxy=claim_proxy))
+                ok2, detail2, bal2 = _cfn(out["jwt"], log=log)
                 if ok2:
                     ok_c, detail, bal = ok2, detail2 + "（Chrome 直连）", bal2
                 else:
@@ -669,14 +746,14 @@ def signup(email, password, proxy=None, log=print, activate=None, claim=True, bu
             except Exception:
                 pass
 
-def claim_via_chromium(jwt, log=print, store=None):
+def claim_via_chromium(jwt, log=print, store=None, proxy=""):
     """领赠金兜底（外层）：Chromium 启动必须在新线程里做——
     同一线程里先起过 Camoufox 再起 Chromium 会报 "Playwright Sync API inside the asyncio loop"。"""
     out = {}
 
     def run():
         try:
-            out["r"] = _claim_via_chromium_inner(jwt, log)
+            out["r"] = _claim_via_chromium_inner(jwt, log, proxy=proxy)
         except Exception as e:
             out["e"] = e
     th = threading.Thread(target=run, daemon=True)
@@ -689,7 +766,7 @@ def claim_via_chromium(jwt, log=print, store=None):
     return out["r"]
 
 
-def _claim_via_chromium_inner(jwt, log=print):
+def _claim_via_chromium_inner(jwt, log=print, proxy=""):
     """领赠金专用兜底：平台要求「真 Chrome/Edge + 不用代理/VPN」——
     用 Playwright 自带 Chromium 直连（服务器本机出口，不走代理），把已登录的 JWT 注入 localStorage 再领。
     返回 (ok, detail, balance)"""
@@ -705,7 +782,10 @@ def _claim_via_chromium_inner(jwt, log=print):
     br = None
     try:
         with sync_playwright() as p:
-            br = p.chromium.launch(headless=False, args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
+            args = ["--no-sandbox", "--disable-blink-features=AutomationControlled"]
+            if proxy:
+                args.append("--proxy-server=" + proxy.split("@")[-1].replace("http://", "").replace("https://", ""))
+            br = p.chromium.launch(headless=False, args=args)
             ctx = br.new_context(locale="en-US", viewport={"width": 1400, "height": 920})
             page = ctx.new_page()
             page.goto(BASE + "/login.html", wait_until="domcontentloaded", timeout=90000)
@@ -727,3 +807,409 @@ def _claim_via_chromium_inner(jwt, log=print):
                 br.close()
             except Exception:
                 pass
+
+CLAIM_DIRECT_JS = """async (arg) => {
+  // 完全绕开页面那条坏掉的脚本链：自己把 CF 的 turnstile 全局跑起来（fetch+eval，CORS=* 可读）
+  let el = document.getElementById('zClaimSlot');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'zClaimSlot';
+    el.style.cssText = 'min-height:70px;display:flex;align-items:center;justify-content:center';
+    const host = document.getElementById('welcomeClaimTurnstile') || document.body;
+    host.appendChild(el);
+  }
+  if (typeof window.turnstile === 'undefined') {
+    // CF 的脚本要求能找到「它自己的 script 标签」（否则报 Could not find Turnstile valid script tag）：
+    // 先把标签插成最后一个 script，再 eval 源码——标签存在 + 代码执行，两头都满足
+    const TS_SRC = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+    let tag = document.querySelector('script[src*="challenges.cloudflare.com/turnstile"]');
+    if (!tag) {
+      tag = document.createElement('script');
+      tag.src = TS_SRC;
+      tag.async = true;
+      document.head.appendChild(tag);
+      await new Promise(r => setTimeout(r, 1200));
+    } else {
+      document.head.appendChild(tag);      // 挪到最后，保证"最后一个 script"就是它
+      await new Promise(r => setTimeout(r, 300));
+    }
+    if (typeof window.turnstile === 'undefined') {
+      try {
+        const t = await (await fetch(TS_SRC, {cache: 'no-store'})).text();
+        (0, eval)(t);
+      } catch (e) { return {err: 'api.js: ' + (e && e.message)}; }
+    }
+    for (let i = 0; i < 40 && typeof window.turnstile === 'undefined'; i++) {
+      await new Promise(r => setTimeout(r, 250));
+    }
+  }
+  if (typeof window.turnstile === 'undefined') return {err: 'turnstile 全局仍不可用'};
+  try {
+    if (window.__zClaimWidget != null) { try { turnstile.remove(window.__zClaimWidget); } catch (e) {} }
+    window.__zClaimWidget = turnstile.render(el, {sitekey: arg.sitekey, theme: 'light', size: 'flexible'});
+  } catch (e) { return {err: 'render: ' + (e && e.message)}; }
+  return {widget: window.__zClaimWidget, type: typeof window.turnstile};
+}"""
+
+CLAIM_POLL_JS = """() => { try {
+  if (window.__zClaimWidget == null || typeof window.turnstile === 'undefined') return '';
+  return window.turnstile.getResponse(window.__zClaimWidget) || '';
+} catch (e) { return ''; } }"""
+
+
+def _claim_direct_api(page, wc, log=None):
+    """不依赖页面脚本链的领取：自己渲染 Turnstile → 拿 token → 直接调他们的领取接口。
+    参数与他们前端完全一致（sitekey/theme/size 与 render() 相同；device_token 取自 welcome-credit）。"""
+    import time as _t
+    try:
+        relay_fpjs_routes(page, log)
+    except Exception:
+        pass
+    sitekey = ""
+    try:
+        st, d = _fetch(page, "/api/public/auth-config")
+        sitekey = str((d or {}).get("turnstile_site_key") or "")
+    except Exception:
+        pass
+    if not sitekey:
+        return False, "拿不到 turnstile sitekey"
+    r = page.evaluate(CLAIM_DIRECT_JS, {"sitekey": sitekey})
+    if isinstance(r, dict) and r.get("err"):
+        return False, f"自渲染控件失败：{r['err']}"
+    if log:
+        log(f"[浏览器] 自渲染领取控件（widget={r.get('widget')}，turnstile={r.get('type')}）")
+    tok = ""
+    waited = 0
+    while waited < 120:
+        page.wait_for_timeout(2500)
+        waited += 2.5
+        tok = page.evaluate(CLAIM_POLL_JS) or ""
+        if tok:
+            break
+        if waited in (15, 45, 75):                    # 卡住就点一次挑战复选框
+            try:
+                box = page.locator("#zClaimSlot iframe").first.bounding_box()
+                if box:
+                    x, y = box["x"] + 30, box["y"] + box["height"] / 2
+                    page.mouse.move(x - 70, y - 40)
+                    page.wait_for_timeout(200)
+                    page.mouse.move(x, y, steps=16)
+                    page.mouse.click(x, y)
+                    if log:
+                        log("[浏览器] 点了一次自渲染控件的复选框")
+            except Exception:
+                pass
+        if not tok and waited % 20 == 0 and log:
+            log(f"[浏览器] 等自渲染控件出 token… {int(waited)}s")
+    if not tok:
+        return False, "自渲染控件 120s 未产出 token（CF 未放行）"
+    if log:
+        log(f"[浏览器] ✔ 自渲染控件拿到 token（{len(tok)} 字节）→ 直接提交领取")
+    dtok = str((wc or {}).get("device_token") or "")
+    if dtok:
+        try:
+            page.evaluate("(t) => { document.cookie = 'joy_wc_did=' + t + '; path=/; max-age=86400'; }", dtok)
+        except Exception:
+            pass
+    body = {"turnstile_token": tok, "fp_event_id": "", "visitor_id": "", "fp_attempted": False,
+            "claim_nonce": "", "device_token": dtok}
+    st2, d2 = _fetch(page, "/api/user/welcome-credit/claim", "POST", body)
+    if log:
+        log(f"[浏览器] 领取第一步返回：HTTP {st2} {json.dumps(d2, ensure_ascii=False)[:220]}")
+    d2 = d2 or {}
+    if d2.get("need_fingerprint"):
+        # 第二步：设备指纹（他们前端就是 import FingerprintJS v4 → start({region, linkedId})）
+        pub = str(d2.get("fingerprint_public_key") or "")
+        region = str(d2.get("fingerprint_region") or (wc or {}).get("fingerprint_region") or "us")
+        nonce = str(d2.get("claim_nonce") or "")
+        if not pub:
+            return False, "平台要求设备指纹但没给公钥（fingerprint_public_key 为空）"
+        if log:
+            log(f"[浏览器] 走第二步：设备指纹（region={region}，public_key={pub[:10]}…）")
+        src_b64 = ""
+        try:
+            import base64 as _b64
+            import requests as _rq
+            rr = _rq.get("https://fpjscdn.net/v4/" + pub, timeout=30,
+                         headers={"User-Agent": UA if "UA" in globals() else "Mozilla/5.0",
+                                  "Origin": BASE})
+            if rr.status_code == 200 and len(rr.content) > 1000:
+                src_b64 = _b64.b64encode(rr.content).decode()
+                if log:
+                    log(f"[浏览器] 服务器直连取到指纹模块（{len(rr.content) // 1024} KB），备用注入")
+            elif log:
+                log(f"[浏览器] 服务器直连取指纹模块失败：HTTP {rr.status_code}")
+        except Exception as e:
+            if log:
+                log(f"[浏览器] 服务器直连取指纹模块异常：{type(e).__name__}: {str(e)[:80]}")
+        fp = page.evaluate(FP_JS, {"pub": pub, "region": region, "nonce": nonce, "src_b64": src_b64})
+        if log:
+            log(f"[浏览器] 指纹结果：{json.dumps(fp, ensure_ascii=False)[:200]}")
+        if isinstance(fp, dict) and fp.get("err"):
+            return False, f"设备指纹采集失败：{fp['err']}"
+        body2 = {"turnstile_token": "", "fp_event_id": str(fp.get("event_id") or ""),
+                 "visitor_id": str(fp.get("visitor_id") or ""), "fp_attempted": True,
+                 "claim_nonce": nonce,
+                 "device_token": str(d2.get("device_token") or dtok)}
+        st3, d3 = _fetch(page, "/api/user/welcome-credit/claim", "POST", body2)
+        if log:
+            log(f"[浏览器] 领取第二步返回：HTTP {st3} {json.dumps(d3, ensure_ascii=False)[:260]}")
+        d3 = d3 or {}
+        ok = bool(d3.get("success"))
+        msg = d3.get("message") or d3.get("error") or ("领取成功" if ok else "领取失败")
+        return ok, str(msg)[:220]
+    ok = bool(d2.get("success"))
+    msg = d2.get("message") or d2.get("error") or ("领取成功" if ok else "领取失败")
+    return ok, str(msg)[:220]
+
+FP_JS = """async (arg) => {
+  const url = 'https://fpjscdn.net/v4/' + encodeURIComponent(arg.pub);
+  const opts = {region: arg.region, linkedId: arg.nonce};
+  // ① 与官网前端一模一样的动态 import
+  try {
+    const mod = await import(url);
+    const F = (mod && mod.start) ? mod : (mod && mod.default);
+    if (F && typeof F.start === 'function') {
+      const r = await F.start(opts);
+      return {event_id: (r && (r.event_id || r.requestId || r.request_id)) || '',
+              visitor_id: (r && (r.visitor_id || r.visitorId)) || '', via: 'import'};
+    }
+  } catch (e) { /* 落到兜底 */ }
+  // ①.5 出口代理会把 CDN 响应改坏（实测 SRI 都对不上）→ 用服务器直连取回来的原文，走 Blob 模块
+  if (arg.src_b64) {
+    try {
+      const bin = atob(arg.src_b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const text = new TextDecoder('utf-8').decode(bytes);
+      const blobUrl = URL.createObjectURL(new Blob([text], {type: 'text/javascript'}));
+      const mod = await import(blobUrl);
+      const F = (mod && mod.start) ? mod : (mod && mod.default);
+      if (F && typeof F.start === 'function') {
+        const r = await F.start(opts);
+        return {event_id: (r && (r.event_id || r.requestId || r.request_id)) || '',
+                visitor_id: (r && (r.visitor_id || r.visitorId)) || '', via: 'blob'};
+      }
+      return {err: 'blob 模块没有 start()'};
+    } catch (e) { return {err: 'blob: ' + String(e && (e.message || e)).slice(0, 120)}; }
+  }
+  // ② 内联 module 脚本兜底（页面没有 CSP，内联可执行）
+  try {
+    window.__zFp = null;
+    const s = document.createElement('script');
+    s.type = 'module';
+    s.textContent = "import('" + url + "').then(m => { const F = (m && m.start) ? m : (m && m.default);"
+      + " return F.start(" + JSON.stringify(opts) + "); })"
+      + ".then(r => { window.__zFp = {event_id: (r && (r.event_id || r.requestId || r.request_id)) || '',"
+      + " visitor_id: (r && (r.visitor_id || r.visitorId)) || '', via: 'inline'}; })"
+      + ".catch(e => { window.__zFp = {err: String(e && e.message || e)}; });";
+    document.head.appendChild(s);
+    for (let i = 0; i < 60; i++) {
+      if (window.__zFp) return window.__zFp;
+      await new Promise(r => setTimeout(r, 500));
+    }
+    return {err: '指纹模块 30s 没返回'};
+  } catch (e) { return {err: String(e && e.message || e)}; }
+}"""
+
+# ============ 自渲染 Turnstile（不依赖页面那条时好时坏的脚本链）============
+SELF_TS_JS = """async (arg) => {
+  let el = document.getElementById(arg.slot);
+  if (!el) {
+    el = document.createElement('div');
+    el.id = arg.slot;
+    el.style.cssText = 'min-height:70px;display:flex;align-items:center;justify-content:center;margin:1rem 0';
+    (document.querySelector('main') || document.body).appendChild(el);
+  }
+  if (typeof window.turnstile === 'undefined') {
+    const TS_SRC = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+    let tag = document.querySelector('script[src*="challenges.cloudflare.com/turnstile"]');
+    if (!tag) {
+      tag = document.createElement('script');
+      tag.src = TS_SRC; tag.async = true;
+      document.head.appendChild(tag);
+      await new Promise(r => setTimeout(r, 1200));
+    } else {
+      document.head.appendChild(tag);
+      await new Promise(r => setTimeout(r, 300));
+    }
+    if (typeof window.turnstile === 'undefined' && arg.api_src_b64) {
+      try {
+        const bin = atob(arg.api_src_b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        (0, eval)(new TextDecoder('utf-8').decode(bytes));
+      } catch (e) { return {err: 'api.js eval: ' + (e && e.message)}; }
+    }
+    for (let i = 0; i < 40 && typeof window.turnstile === 'undefined'; i++) {
+      await new Promise(r => setTimeout(r, 250));
+    }
+  }
+  if (typeof window.turnstile === 'undefined') return {err: 'turnstile 全局不可用'};
+  try {
+    if (window.__zWid != null) { try { turnstile.remove(window.__zWid); } catch (e) {} }
+    window.__zWid = turnstile.render(el, {sitekey: arg.sitekey, theme: 'light', size: 'flexible'});
+  } catch (e) { return {err: 'render: ' + (e && e.message)}; }
+  return {widget: window.__zWid};
+}"""
+
+SELF_TS_POLL_JS = """() => { try {
+  if (window.__zWid == null || typeof window.turnstile === 'undefined') return '';
+  return window.turnstile.getResponse(window.__zWid) || '';
+} catch (e) { return ''; } }"""
+
+
+def _fetch_text_direct(url, timeout=30):
+    """服务器直连取文件原文（出口代理会把部分 CDN 响应改坏，正文由服务器直连取）"""
+    import requests as _rq
+    try:
+        r = _rq.get(url, timeout=timeout, headers={"User-Agent":
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"})
+        if r.status_code == 200 and len(r.content) > 500:
+            import base64 as _b64
+            return _b64.b64encode(r.content).decode()
+    except Exception:
+        pass
+    return ""
+
+
+def _sitekey(page, log=None):
+    try:
+        st, d = _fetch(page, "/api/public/auth-config")
+        return str((d or {}).get("turnstile_site_key") or "")
+    except Exception:
+        return ""
+
+
+def selfrender_token(page, sitekey, log=None, slot="zTsSlot", wait=100):
+    """自渲染 Turnstile 并拿 token（CF 的 api.js 拿不到就由服务器直连取原文注入）"""
+    api_b64 = ""
+    if not page.evaluate("() => typeof window.turnstile !== 'undefined'"):
+        api_b64 = _fetch_text_direct("https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit")
+    r = page.evaluate(SELF_TS_JS, {"slot": slot, "sitekey": sitekey, "api_src_b64": api_b64})
+    if isinstance(r, dict) and r.get("err"):
+        if log:
+            log(f"[浏览器] 自渲染 Turnstile 失败：{r['err']}")
+        return ""
+    if log:
+        log(f"[浏览器] 自渲染 Turnstile（{slot}，widget={r.get('widget')}）")
+    waited = 0
+    while waited < wait:
+        page.wait_for_timeout(2500)
+        waited += 2.5
+        tok = page.evaluate(SELF_TS_POLL_JS) or ""
+        if tok:
+            if log:
+                log(f"[浏览器] ✔ Turnstile token 到手（{len(tok)} 字节，{int(waited)}s）")
+            return tok
+        if waited in (15, 40, 65):
+            try:
+                box = page.locator("#" + slot + " iframe").first.bounding_box()
+                if box:
+                    x, y = box["x"] + 30, box["y"] + box["height"] / 2
+                    page.mouse.move(x - 70, y - 40)
+                    page.wait_for_timeout(200)
+                    page.mouse.move(x, y, steps=16)
+                    page.mouse.click(x, y)
+            except Exception:
+                pass
+    if log:
+        log("[浏览器] 自渲染 Turnstile 到点没出 token")
+    return ""
+
+
+def register_via_api(page, email, password, log=None):
+    """直接调他们的注册接口（与页面表单同一 payload），自己带 Turnstile token。
+    返回 (ok, detail, code)"""
+    sitekey = _sitekey(page, log)
+    if not sitekey:
+        return False, "拿不到 sitekey", "sitekey"
+    for attempt in (1, 2):
+        tok = selfrender_token(page, sitekey, log=log, slot="zRegSlot")
+        if not tok:
+            return False, "自渲染 Turnstile 拿不到 token", "turnstile"
+        body = {"email": email, "password": password}
+        if tok and tok != "disabled":
+            body["turnstile_token"] = tok
+        st, d = _fetch(page, "/api/auth/register", "POST", body)
+        d = d or {}
+        if log:
+            log(f"[浏览器] 注册接口（第 {attempt} 次）：HTTP {st} {json.dumps(d, ensure_ascii=False)[:180]}")
+        _msg = str(d.get("message") or "")
+        # 他们的成功响应是 {message: "Registration successful!...", user:{...}}——没有 success 字段
+        if st == 200 and (d.get("success") or d.get("user") or "successful" in _msg.lower()):
+            return True, _msg or "注册成功", ""
+        code = str(d.get("error") or "")
+        if code in ("captcha_failed", "turnstile_failed"):
+            continue                                  # 换一个新 token 再来一次
+        if code == "region_not_supported":
+            return False, "地区不支持（换出口）", "region"
+        _low = (code + " " + str(d.get("message") or "")).lower()
+        if any(k in _low for k in ("exist", "already registered", "registered", "已注册")):
+            return True, "邮箱已注册（跳过注册，直接激活/登录）", "exists"
+        return False, str(d.get("message") or code or f"HTTP {st}")[:160], code or "api"
+    return False, "注册被拒（Turnstile 连续失败）", "turnstile"
+
+
+def login_via_api(page, email, password, log=None):
+    """直接调登录接口，拿 JWT 写进 localStorage（与页面登录同一 payload）。
+    返回 (ok, detail, jwt)"""
+    sitekey = _sitekey(page, log)
+    for attempt in (1, 2):
+        tok = selfrender_token(page, sitekey, log=log, slot="zLoginSlot") if sitekey else ""
+        if not tok:
+            return False, "自渲染 Turnstile 拿不到 token", ""
+        body = {"username": email, "password": password}
+        if tok and tok != "disabled":
+            body["turnstile_token"] = tok
+        st, d = _fetch(page, "/api/auth/login", "POST", body)
+        d = d or {}
+        if log:
+            log(f"[浏览器] 登录接口（第 {attempt} 次）：HTTP {st} {json.dumps(d, ensure_ascii=False)[:160]}")
+        jwt = str(d.get("token") or "")
+        if st == 200 and jwt:
+            try:
+                page.evaluate("(t) => localStorage.setItem('joypyroxy_token', t)", jwt)
+            except Exception:
+                pass
+            return True, "已登录控制台（接口直登）", jwt
+        code = str(d.get("error") or "")
+        if code in ("captcha_failed", "turnstile_failed"):
+            continue
+        return False, str(d.get("message") or code or f"HTTP {st}")[:160], ""
+    return False, "登录被拒（Turnstile 连续失败）", ""
+
+def relay_fpjs_routes(page, log=None):
+    """把 FingerprintJS 相关域名的请求改成服务器直连转发（playwright route intercept）。
+    出口代理会把这些 CDN 响应改坏/拦掉，导致指纹事件拿不到 event_id。"""
+    import requests as _rq
+
+    def handler(route):
+        req = route.request
+        try:
+            h = {k: v for k, v in (req.headers or {}).items()
+                 if k.lower() not in ("host", "content-length", "accept-encoding", "connection")}
+            kw = {"headers": h, "timeout": 30}
+            if req.method.upper() == "POST" and req.post_data_buffer:
+                kw["data"] = req.post_data_buffer
+            r = _rq.request(req.method, req.url, **kw)
+            route.fulfill(status=r.status_code, headers=dict(r.headers), body=r.content)
+        except Exception as e:
+            if log:
+                log(f"[浏览器] 指纹转发失败（{req.url.split('/')[2]}）：{type(e).__name__}: {str(e)[:60]}")
+            try:
+                route.abort()
+            except Exception:
+                pass
+
+    n = 0
+    for pat in ("**fpjscdn.net/**", "**api.fpjs.io/**", "**api.fpjs.com/**"):
+        try:
+            page.route(pat, handler)
+            n += 1
+        except Exception:
+            pass
+    if log and n:
+        log(f"[浏览器] 指纹域名已改为服务器直连转发（{n} 条规则）")
+    return n
