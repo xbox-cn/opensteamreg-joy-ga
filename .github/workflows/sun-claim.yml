@@ -91,7 +91,8 @@ jobs:
           $env:JOY_EMAIL = "${{ inputs.joy_email }}"
           if (-not $env:JOY_EMAIL) { $env:JOY_EMAIL = "${{ secrets.JOY_CLAIM_EMAIL }}" }
           $env:JOY_PASSWORD = "${{ secrets.JOY_CLAIM_PASSWORD }}"
-          if (-not $env:JOY_EMAIL -or -not $env:JOY_PASSWORD) { throw "缺 JOY_CLAIM_EMAIL / JOY_CLAIM_PASSWORD secrets" }
+          $env:JOY_MAILBOX = "${{ secrets.JOY_MAILBOX_LINE }}"
+          if (-not $env:JOY_MAILBOX) { throw "缺 JOY_MAILBOX_LINE secret" }
           python sun_claim.py 2>&1 | Tee-Object -FilePath joy-claim.log
           Write-Host "exit=$LASTEXITCODE"
 
