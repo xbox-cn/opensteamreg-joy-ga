@@ -1,0 +1,113 @@
+name: Sun claim (Windows + SunBrowser)
+
+on:
+  workflow_dispatch:
+    inputs:
+      joy_email:
+        description: "JoyProxy 账号邮箱（空=用 secret JOY_CLAIM_EMAIL）"
+        required: false
+        default: ""
+      timeout_minutes:
+        description: "Job timeout minutes"
+        required: true
+        default: "25"
+
+jobs:
+  sun-claim:
+    runs-on: windows-latest
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
+    env:
+      PYTHONIOENCODING: utf-8
+      SUN_SHA256: 6b581f37974bdb9e512337e997cf06276424331c43c9de2ad887bc0a01eebdef
+      SUN_URL: https://github.com/xbox-cn/opensteamreg-joy-ga/releases/download/sunbrowser-localfp-win-20261021/SunBrowser-LocalFP-Win-x64-20261021.tar.gz
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python deps
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install --upgrade pip
+          python -m pip install playwright requests
+
+      - name: Download SunBrowser package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dst = "$env:RUNNER_TEMP\sun.tar.gz"
+          Invoke-WebRequest -Uri "$env:SUN_URL" -OutFile $dst
+          $hash = (Get-FileHash -Algorithm SHA256 $dst).Hash.ToLower()
+          if ($hash -ne $env:SUN_SHA256) { throw "sha256 mismatch: $hash" }
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\sun" | Out-Null
+          tar -xzf $dst -C "$env:RUNNER_TEMP\sun"
+          $root = Get-ChildItem "$env:RUNNER_TEMP\sun" -Directory | Select-Object -First 1
+          "SUN_ROOT=$($root.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "SUN_ROOT=$($root.FullName)"
+
+      - name: Generate fresh US profile
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $id = "joy-us-$($env:GITHUB_RUN_ID)"
+          Push-Location "$env:SUN_ROOT"
+          node local-profile-generator.mjs --count 1 --profile-id $id --region us --seed "ga-$id"
+          Pop-Location
+          "SUN_PROFILE=$id" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Launch SunBrowser
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          Push-Location "$env:SUN_ROOT"
+          Start-Process -FilePath "node" -ArgumentList "portable-launcher.mjs","--profile","$env:SUN_PROFILE","--remote-debugging-port","9222","--url","about:blank" -WindowStyle Hidden
+          Pop-Location
+          $ok = $false
+          for ($i = 0; $i -lt 40; $i++) {
+            Start-Sleep -Seconds 3
+            try {
+              $v = Invoke-WebRequest -Uri "http://127.0.0.1:9222/json/version" -TimeoutSec 3 -UseBasicParsing
+              Write-Host $v.Content.Substring(0, [Math]::Min(120, $v.Content.Length))
+              $ok = $true; break
+            } catch { }
+          }
+          if (-not $ok) { throw "CDP 9222 没起来" }
+
+      - name: Run claim
+        id: claim
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $env:JOY_EMAIL = "${{ inputs.joy_email }}"
+          if (-not $env:JOY_EMAIL) { $env:JOY_EMAIL = "${{ secrets.JOY_CLAIM_EMAIL }}" }
+          $env:JOY_PASSWORD = "${{ secrets.JOY_CLAIM_PASSWORD }}"
+          if (-not $env:JOY_EMAIL -or -not $env:JOY_PASSWORD) { throw "缺 JOY_CLAIM_EMAIL / JOY_CLAIM_PASSWORD secrets" }
+          python sun_claim.py 2>&1 | Tee-Object -FilePath joy-claim.log
+          Write-Host "exit=$LASTEXITCODE"
+
+      - name: Summarize
+        if: always()
+        shell: pwsh
+        run: |
+          "## Sun claim (Windows)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          if (Test-Path joy-claim.log) {
+            Get-Content joy-claim.log | Select-String -Pattern "JOY_RESULT|CLAIM|BUY|extract|exit_ip|login|Turnstile" | ForEach-Object { $_.Line } | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sun-claim-${{ github.run_id }}
+          path: |
+            joy-claim.log
