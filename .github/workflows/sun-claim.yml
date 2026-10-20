@@ -83,9 +83,13 @@ jobs:
           Write-Host "exit_line=$($exit -replace '://.*@', '://***@')"
           "JOY_PROXY_URL=$exit" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           $env:JOY_PROXY_URL = $exit
-          Start-Process -FilePath python -ArgumentList "joy_relay.py","18080" -WindowStyle Hidden
+          Start-Process -FilePath python -ArgumentList "joy_relay.py","18080" -WindowStyle Hidden -RedirectStandardOutput "$env:RUNNER_TEMP/relay.out.log" -RedirectStandardError "$env:RUNNER_TEMP/relay.err.log"
           Start-Sleep -Seconds 3
-          Write-Host "relay started on 18080"
+          try {
+            $r = Invoke-WebRequest -Uri "http://127.0.0.1:18080/" -TimeoutSec 5 -UseBasicParsing -SkipHttpErrorCheck
+            Write-Host "relay probe: HTTP $($r.StatusCode) (501=alive)"
+          } catch { Write-Host "relay probe FAILED: $_"; Get-Content "$env:RUNNER_TEMP/relay.err.log" -ErrorAction SilentlyContinue | Select-Object -First 10 }
+          Write-Host "relay step done"
 
       - name: Launch SunBrowser
         shell: pwsh
@@ -94,7 +98,9 @@ jobs:
           $proxyArgs = @()
           if ("${{ inputs.use_proxy }}" -eq "true") { $proxyArgs = @("--proxy","http://127.0.0.1:18080"); Write-Host "browser via relay 18080" }
           Push-Location "$env:SUN_ROOT"
-          Start-Process -FilePath "node" -ArgumentList @("portable-launcher.mjs","--profile","$env:SUN_PROFILE","--remote-debugging-port","9222","--url","about:blank") + $proxyArgs -WindowStyle Hidden
+          $la = @("portable-launcher.mjs","--profile","$env:SUN_PROFILE","--remote-debugging-port","9222","--url","about:blank") + $proxyArgs
+          Write-Host ("launcher args: " + ($la -join " "))
+          Start-Process -FilePath "node" -ArgumentList $la -WindowStyle Hidden -RedirectStandardOutput "$env:RUNNER_TEMP/sun-launch.out.log" -RedirectStandardError "$env:RUNNER_TEMP/sun-launch.err.log"
           Pop-Location
           $ok = $false
           for ($i = 0; $i -lt 40; $i++) {
@@ -136,3 +142,7 @@ jobs:
           name: sun-claim-${{ github.run_id }}
           path: |
             joy-claim.log
+            ${{ runner.temp }}/sun-launch.out.log
+            ${{ runner.temp }}/sun-launch.err.log
+            ${{ runner.temp }}/relay.out.log
+            ${{ runner.temp }}/relay.err.log
