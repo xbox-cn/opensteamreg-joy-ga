@@ -32,7 +32,8 @@ def log(m):
 
 
 def main():
-    out = {"ok": False, "email": EMAIL, "balance": None, "claim": "", "extract_url": ""}
+    joy_email, joy_pw = EMAIL, PASSWORD
+    out = {"ok": False, "email": joy_email, "balance": None, "claim": "", "extract_url": ""}
     with sync_playwright() as p:
         br = p.chromium.connect_over_cdp(CDP)
         ctx = br.contexts[0]
@@ -50,20 +51,20 @@ def main():
         if MAILBOX:
             parts = MAILBOX.split("----")
             row = {"email": parts[0], "password": parts[1], "client_id": parts[2], "refresh_token": parts[3]}
-            EMAIL = row["email"]
-            PASSWORD = os.environ.get("JOY_NEW_PASSWORD", "") or ("Jp!Ga" + str(int(time.time()))[-7:])
-            out["email"], out["password"] = EMAIL, PASSWORD
-            log(f"register {EMAIL} (joy pw={PASSWORD})")
+            joy_email = row["email"]
+            joy_pw = os.environ.get("JOY_NEW_PASSWORD", "") or ("Jp!Ga" + str(int(time.time()))[-7:])
+            out["email"], out["password"] = joy_email, joy_pw
+            log(f"register {joy_email} (joy pw={joy_pw})")
             page.goto(JB.REGISTER, wait_until="domcontentloaded", timeout=90000)
             page.wait_for_timeout(3000)
             JB._dismiss_cookie(page, log)
             JB._ensure_turnstile(page, log)
             page.wait_for_timeout(1000)
-            ok_api, detail_api, code_api = JB.register_via_api(page, EMAIL, PASSWORD, log=log)
+            ok_api, detail_api, code_api = JB.register_via_api(page, joy_email, joy_pw, log=log)
             if not ok_api:
                 log(f"接口注册没成（{detail_api}）→ 表单方式")
-                page.fill("#email", EMAIL)
-                page.fill("#password", PASSWORD)
+                page.fill("#email", joy_email)
+                page.fill("#password", joy_pw)
                 page.wait_for_timeout(600)
                 tok = JB._solve_turnstile(page, "register", log)
                 if not tok:
@@ -92,11 +93,11 @@ def main():
             ok, detail, jwt = True, "激活后自动登录", jwt0
             log("跳过登录（激活后自动登录）")
         else:
-            ok, detail, jwt = JB.login_via_api(page, EMAIL, PASSWORD, log=log)
+            ok, detail, jwt = JB.login_via_api(page, joy_email, joy_pw, log=log)
         log(f"login_api={ok} {detail[:120]}")
         if not ok:
-            page.fill("#email", EMAIL)
-            page.fill("#password", PASSWORD)
+            page.fill("#email", joy_email)
+            page.fill("#password", joy_pw)
             page.wait_for_timeout(500)
             tok = JB._solve_turnstile(page, "login", log)
             if not tok:
